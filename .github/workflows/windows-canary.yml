@@ -174,6 +174,26 @@ jobs:
         shell: pwsh
         run: ./scripts/bundle-windows-mesh-runtime-deps.ps1
 
+      # The Cargo cache restores a previously built installer: the exclusion
+      # "!desktop/src-tauri/target/**/release/bundle" drops the directory entry but not
+      # its contents, so bundle/nsis/*.exe from an earlier run comes back. "Locate NSIS
+      # installer" then does `find ... | head -1` and can pick the stale one, which is
+      # how run 5 built Buzz_0.5.9-test.5 and uploaded Buzz_0.5.9-test.4. Purge the
+      # directory so exactly one installer can exist when we go looking for it.
+      - name: Purge stale NSIS bundle restored from cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="desktop/src-tauri/target/${TARGET}/release/bundle/nsis"
+          if [[ -d "$DIR" ]]; then
+            echo "stale installers present before build:"
+            find "$DIR" -name '*.exe' -type f -printf '  %f\n' || true
+            rm -rf "$DIR"
+            echo "purged $DIR"
+          else
+            echo "no pre-existing $DIR"
+          fi
+
       - name: Build Windows NSIS installer (unsigned)
         shell: bash
         run: cd desktop && pnpm tauri build --target "$TARGET" --bundles nsis --features mesh-llm --config src-tauri/tauri.canary.conf.json
@@ -183,14 +203,29 @@ jobs:
       - name: Locate NSIS installer
         id: artifact
         shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           BUNDLE_DIR="desktop/src-tauri/target/${TARGET}/release/bundle"
-          EXE=$(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f | head -1)
-          if [[ -z "$EXE" ]]; then
+          mapfile -t FOUND < <(find "$BUNDLE_DIR/nsis" -name '*.exe' -type f)
+          if [[ ${#FOUND[@]} -eq 0 ]]; then
             echo "::error::No NSIS installer found in $BUNDLE_DIR/nsis"
             exit 1
           fi
+          if [[ ${#FOUND[@]} -gt 1 ]]; then
+            printf '::error::Multiple NSIS installers present; refusing to guess:\n'
+            printf '  %s\n' "${FOUND[@]}"
+            exit 1
+          fi
+          EXE="${FOUND[0]}"
+          # The installer must be the one THIS run built. Without this, a stale
+          # installer restored from the Cargo cache uploads as a green artifact.
+          if [[ "$(basename "$EXE")" != *"$VERSION"* ]]; then
+            echo "::error::Installer $(basename "$EXE") does not match version $VERSION built by this run"
+            exit 1
+          fi
+          echo "verified installer matches $VERSION: $EXE"
           echo "exe=$EXE" >> "$GITHUB_OUTPUT"
 
       - name: Upload Windows canary installer
