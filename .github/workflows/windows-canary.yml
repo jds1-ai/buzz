@@ -148,6 +148,32 @@ jobs:
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
 
+      # READ-ONLY PRE-STATE PROBE. Our previous fork run installed MinGW here before the
+      # bundler; that step is deliberately REMOVED so PR #3223's own bootstrap
+      # (pacman -> choco -> assert) is the thing under test rather than something we
+      # already satisfied for it. This step must install NOTHING - it only records which
+      # of the four DLLs the stock runner has, so a bundler PASS can be attributed. If all
+      # four were already present, a PASS proves nothing about the bootstrap.
+      - name: Probe MinGW pre-state (installs nothing)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $need = 'libgcc_s_seh-1.dll','libstdc++-6.dll','libgomp-1.dll','libwinpthread-1.dll'
+          $dirs = 'C:\msys64\mingw64\bin','C:\msys64\ucrt64\bin','C:\ProgramData\mingw64\mingw64\bin','C:\Program Files\Git\mingw64\bin'
+          Write-Host "runner image: $env:ImageOS / $env:ImageVersion"
+          foreach ($d in $dirs) { Write-Host ("dir {0,-45} exists={1}" -f $d, (Test-Path -LiteralPath $d)) }
+          Write-Host "pacman present: $(Test-Path -LiteralPath 'C:\msys64\usr\bin\pacman.exe')"
+          Write-Host "choco present:  $([bool](Get-Command choco -ErrorAction SilentlyContinue))"
+          $missing = @()
+          foreach ($n in $need) {
+            $hit = $dirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ $n) } | Select-Object -First 1
+            if ($hit) { Write-Host "PRESENT  $n  <-  $hit" } else { Write-Host "MISSING  $n"; $missing += $n }
+          }
+          Write-Host "PROBE_MISSING_BEFORE=$($missing -join ',')"
+          if ($missing.Count -eq 0) {
+            Write-Host "::warning::All four DLLs already present on the stock runner - a bundler PASS does NOT exercise the bootstrap."
+          }
+
       - name: Bundle Windows MeshLLM runtime dependencies
         shell: pwsh
         run: ./scripts/bundle-windows-mesh-runtime-deps.ps1
