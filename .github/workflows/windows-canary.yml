@@ -144,45 +144,30 @@ jobs:
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
 
-      # The windows-latest image is now windows-2025-vs2026, which ships none of the
-      # MinGW directories bundle-windows-mesh-runtime-deps.ps1 searches except Git's,
-      # and Git for Windows does not include libgomp-1.dll. Without this step that
-      # script throws "Missing Windows MeshLLM runtime dependency: libgomp-1.dll".
-      - name: Provide MinGW runtime DLLs for the bundler
+      # READ-ONLY PRE-STATE PROBE. Our previous fork run installed MinGW here before the
+      # bundler; that step is deliberately REMOVED so PR #3223's own bootstrap
+      # (pacman -> choco -> assert) is the thing under test rather than something we
+      # already satisfied for it. This step must install NOTHING - it only records which
+      # of the four DLLs the stock runner has, so a bundler PASS can be attributed. If all
+      # four were already present, a PASS proves nothing about the bootstrap.
+      - name: Probe MinGW pre-state (installs nothing)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $need = 'libgcc_s_seh-1.dll','libstdc++-6.dll','libgomp-1.dll','libwinpthread-1.dll'
           $dirs = 'C:\msys64\mingw64\bin','C:\msys64\ucrt64\bin','C:\ProgramData\mingw64\mingw64\bin','C:\Program Files\Git\mingw64\bin'
-          function Get-Missing {
-            $need | Where-Object { $n = $_; -not ($dirs | Where-Object { Test-Path (Join-Path $_ $n) }) }
-          }
-          Write-Host "missing before: $((Get-Missing) -join ', ')"
-          if (Get-Missing) {
-            if (Test-Path 'C:\msys64\usr\bin\pacman.exe') {
-              Write-Host 'installing mingw-w64-x86_64-gcc via MSYS2 pacman'
-              & C:\msys64\usr\bin\pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-gcc
-            }
-          }
-          if (Get-Missing) {
-            Write-Host 'falling back to: choco install mingw'
-            choco install mingw -y --no-progress | Out-Null
-          }
-          # choco may land outside the four searched dirs - stage anything found into one of them.
-          if (Get-Missing) {
-            $dest = 'C:\ProgramData\mingw64\mingw64\bin'
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            foreach ($n in (Get-Missing)) {
-              $src = Get-ChildItem -Path 'C:\ProgramData\chocolatey','C:\ProgramData\mingw64','C:\msys64' `
-                       -Filter $n -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($src) { Copy-Item $src.FullName (Join-Path $dest $n) -Force; Write-Host "staged $n from $($src.FullName)" }
-            }
-          }
-          $still = Get-Missing
-          if ($still) { throw "MinGW runtime still unavailable to the bundler: $($still -join ', ')" }
+          Write-Host "runner image: $env:ImageOS / $env:ImageVersion"
+          foreach ($d in $dirs) { Write-Host ("dir {0,-45} exists={1}" -f $d, (Test-Path -LiteralPath $d)) }
+          Write-Host "pacman present: $(Test-Path -LiteralPath 'C:\msys64\usr\bin\pacman.exe')"
+          Write-Host "choco present:  $([bool](Get-Command choco -ErrorAction SilentlyContinue))"
+          $missing = @()
           foreach ($n in $need) {
-            $hit = $dirs | Where-Object { Test-Path (Join-Path $_ $n) } | Select-Object -First 1
-            Write-Host "OK  $n  <-  $hit"
+            $hit = $dirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ $n) } | Select-Object -First 1
+            if ($hit) { Write-Host "PRESENT  $n  <-  $hit" } else { Write-Host "MISSING  $n"; $missing += $n }
+          }
+          Write-Host "PROBE_MISSING_BEFORE=$($missing -join ',')"
+          if ($missing.Count -eq 0) {
+            Write-Host "::warning::All four DLLs already present on the stock runner - a bundler PASS does NOT exercise the bootstrap."
           }
 
       - name: Bundle Windows MeshLLM runtime dependencies
