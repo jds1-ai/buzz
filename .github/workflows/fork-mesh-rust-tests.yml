@@ -1,0 +1,151 @@
+name: Fork Mesh Rust Tests
+
+# FORK-ONLY DIAGNOSTIC. Not proposed for upstream as-is.
+#
+# Question it answers: PR #3223 adds Rust unit tests to
+# desktop/src-tauri/src/mesh_llm/catalog.rs, and none of them has ever run in CI.
+# This job establishes WHY, with evidence rather than assertion, in four steps:
+#
+#   A. Reproduce what CI runs today (`cargo test --workspace`, no features) and
+#      assert it collects ZERO mesh_llm tests. `mod mesh_llm` is
+#      #[cfg(feature = "mesh-llm")], so the tests are never COMPILED -- a test
+#      that is not compiled cannot fail, and its absence looks exactly like a pass.
+#   B. Add --features mesh-llm and assert the same tests now EXIST.
+#   C. Run them and require green.
+#   D. WATCH-RED: break the implementation and require the suite to go RED.
+#      Without D, C is a tautology -- a passing suite that cannot fail proves
+#      nothing about the code. (A green check must be able to go red.)
+#
+# A and B are deliberately two-sided: if A ever finds mesh_llm tests, the premise
+# of this job is wrong and it FAILS LOUDLY rather than quietly reporting success.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mesh-rust-tests:
+    name: Do the mesh-llm catalog tests actually run?
+    if: github.repository == 'jds1-ai/buzz'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Install Tauri dependencies (Linux)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 \
+            build-essential curl file libasound2-dev \
+            libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf wget
+
+      - name: Create sidecar stubs
+        run: just _ensure-sidecar-stubs
+
+      - name: A) What CI runs today -- expect ZERO mesh_llm tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop/src-tauri
+          # Exactly what `just desktop-tauri-test` runs in ci.yml.
+          cargo test --workspace -- --list > /tmp/ci-today.txt 2>&1 || {
+            echo "::error::baseline test listing failed to build"; tail -40 /tmp/ci-today.txt; exit 1; }
+          COUNT=$(grep -c 'mesh_llm' /tmp/ci-today.txt || true)
+          TOTAL=$(grep -c ': test$' /tmp/ci-today.txt || true)
+          echo "CI_TODAY_MESH_TESTS=$COUNT"
+          echo "CI_TODAY_TOTAL_TESTS=$TOTAL"
+          if [[ "$TOTAL" -eq 0 ]]; then
+            echo "::error::collected 0 tests overall -- the listing did not run, so this proves nothing"
+            exit 1
+          fi
+          if [[ "$COUNT" -ne 0 ]]; then
+            echo "::error::PREMISE FALSIFIED -- CI's current command DOES collect $COUNT mesh_llm test(s)."
+            grep 'mesh_llm' /tmp/ci-today.txt
+            exit 1
+          fi
+          echo "CONFIRMED: $TOTAL tests collected, none of them mesh_llm."
+
+      - name: B) With --features mesh-llm -- expect the tests to EXIST
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop/src-tauri
+          cargo test --features mesh-llm --lib mesh_llm -- --list > /tmp/with-feature.txt 2>&1 || {
+            echo "::error::feature-enabled listing failed to build"; tail -60 /tmp/with-feature.txt; exit 1; }
+          COUNT=$(grep -c ': test$' /tmp/with-feature.txt || true)
+          echo "WITH_FEATURE_MESH_TESTS=$COUNT"
+          grep ': test$' /tmp/with-feature.txt || true
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "::error::no mesh_llm tests found even WITH the feature -- filter or path is wrong"
+            exit 1
+          fi
+          echo "CONFIRMED: $COUNT mesh_llm test(s) exist and are invisible to CI today."
+
+      - name: C) Run the mesh-llm tests -- expect GREEN
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop/src-tauri
+          cargo test --features mesh-llm --lib mesh_llm
+
+      - name: D) WATCH-RED -- break the code, require the suite to go RED
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop/src-tauri
+          F=src/mesh_llm/catalog.rs
+          cp "$F" /tmp/catalog.orig.rs
+          # Defeat exactly the defect d7fabfae fixed: an unreadable probe (0 VRAM)
+          # must report Unknown, never a confident fit. Make it lie.
+          python3 - "$F" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p, encoding='utf-8').read()
+          needle = "    if vram_gb <= 0.0 {\n        ModelFit::Unknown\n    } else if"
+          if needle not in s:
+              sys.exit("WATCH-RED SETUP FAILED: the zero-VRAM branch is not in the shape this step expects; "
+                       "update the mutation before trusting this gate.")
+          s = s.replace(needle, "    if vram_gb <= 0.0 {\n        ModelFit::Comfortable\n    } else if", 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print("mutated: zero-VRAM now reports Comfortable instead of Unknown")
+          PY
+          set +e
+          cargo test --features mesh-llm --lib mesh_llm > /tmp/red.txt 2>&1
+          RC=$?
+          set -e
+          cp /tmp/catalog.orig.rs "$F"
+          echo "--- mutated-run tail ---"
+          tail -30 /tmp/red.txt
+          if [[ "$RC" -eq 0 ]]; then
+            echo "::error::WATCH-RED FAILED -- the suite still PASSED with the zero-VRAM branch broken."
+            echo "::error::These tests cannot catch the defect they exist for. Green here means nothing."
+            exit 1
+          fi
+          echo "CONFIRMED: suite went RED (rc=$RC) when the implementation was broken."
+
+      - name: Restore check (tree must be clean)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --quiet; then
+            echo "::error::working tree modified after watch-red -- the mutation was not restored"
+            git diff --stat
+            exit 1
+          fi
+          echo "tree clean: mutation restored."
