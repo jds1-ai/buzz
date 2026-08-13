@@ -29,8 +29,11 @@ jobs:
         env:
           SOURCE_REF: ${{ github.ref }}
         run: |
-          if [[ "$SOURCE_REF" != "refs/heads/main" ]]; then
-            echo "::error::Canary builds must run from main; got $SOURCE_REF"
+          # Fork test branches are allowed deliberately: this fork exists to build unmerged
+          # upstream PRs for on-hardware verification. Upstream intent (a canary artifact comes
+          # from a known, named ref) is preserved -- it may just be a canary/* branch, not main.
+          if [[ "$SOURCE_REF" != "refs/heads/main" && "$SOURCE_REF" != refs/heads/canary/* ]]; then
+            echo "::error::Canary builds must run from main or canary/*; got $SOURCE_REF"
             exit 1
           fi
 
